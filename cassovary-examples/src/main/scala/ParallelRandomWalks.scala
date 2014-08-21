@@ -72,10 +72,8 @@ object ParallelRandomWalk {
           coalesceStep(walks, stepsTaken)
           stepsTaken += 1
           allFinished = walks.forall(_ == -1)
-          printf("\n Finished step %s. %s walks still open", stepsTaken, walks.filter(_ != -1).size)
         }
         hasRun = true
-        printf("\n The current walk took %s steps", stepsTaken)
       }
       (nodeFPG, valFPG)
     }
@@ -171,7 +169,7 @@ object ParallelRandomWalk {
       val dMap = new HashMap[Long, Int]()
 
       val (nodeFPG, valFPG) = run()
-      printf("\nFinished building the FPG at %s milis", watch().inMillis.toInt)
+      printf("\nFinished building the FPG at %s milis. It holds %s nodes.", watch().inMillis.toInt, nodeFPG.infoAllNodes.values.size())
 
       val rootsUF = new UnionFind[Int]()
 
@@ -225,7 +223,7 @@ object ParallelRandomWalk {
       rootIds foreach { rId =>
         runLCA(pairs, idToNode(rId), lcaMap, idToNode)
       }
-      printf("\nThe LCA map contains %s first intersections.", lcaMap.values.size)
+
       var expected = 0
       pairs foreach {
         pairFromProduct(_) match {
@@ -248,14 +246,13 @@ object ParallelRandomWalk {
                 }
               if (distance.isDefined) dMap(productFromComponents(a, b)) = distance.get
             }
-            else if (false) {
-              printf("\nInvestigating non-meet between %s and %s", a, b)
+            else {
+              // printf("\nInvestigating non-meet between %s and %s", a, b)
               assert(idToNode.contains(a))
               assert(idToNode.contains(b))
               val leftPath = findPath(nodeFPG, a)
               val rightPath = findPath(nodeFPG, b)
-              if (leftPath.toSet.intersect(rightPath.toSet).nonEmpty) "Bug in the LCA algorithm!"
-              else printf("\n\t DEBUG : the path from %s is %s \n", a, leftPath.toString())
+              assert (leftPath.toSet.intersect(rightPath.toSet).isEmpty)
             }
         }
       }
@@ -280,7 +277,7 @@ object ParallelRandomWalk {
     val startNodes = scala.io.Source.fromInputStream(startStream).getLines().map((x) => Integer.parseInt(x)).toSeq
     val cleanStartNodes = startNodes.filter( (node) => graph.getNodeById(node).isDefined )
 
-    val maxSteps = 100
+    val maxSteps = 500
 
     val graphUtils = new GraphUtils(graph)
     printf("Now doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
