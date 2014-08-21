@@ -35,13 +35,9 @@ object ParallelRandomWalk {
 
     // Advance all walks by one step, do not look at where they start from or are currently at
     private def takeRandomStep(walks: Array[Int]): Unit = {
-      val walksBefore = walks.filter(_ != -1).size
-      printf("\n%s walks moving for this step.", walks.size - walksBefore)
       for ((x, i) <- walks.view.zipWithIndex)
         // -1 marks a finished walk, which occurs if the cur node doesn't have outgoing edges
         if (x != -1) walks(i) = graph.getNodeById(x).flatMap{ _.randomNeighbor(dir, randNumGen) }.getOrElse(-1)
-      val walksAfter = walks.filter(_ != -1).size
-      printf("\n Killed %s walks which are at the end of their rope.", (walksBefore - walksAfter))
     }
 
     private def coalesceStep(walks: Array[Int], numSteps: Int): Unit = {
@@ -49,24 +45,22 @@ object ParallelRandomWalk {
       val curNodeToSourceIdx = homeNodeIds.indices.groupBy {
         case (i) => walks(i)
       }
-      var coalesced = 0
       // build the FPG for each non-minimal walk meeting here
       curNodeToSourceIdx foreach {
         case (curNode, sourceIndexes) if (curNode != -1) => // for all s in sources, walks from homeNodeIds(s) are meeting at curNode !
           val smallestSourceIdx = sourceIndexes.minBy((i) => homeNodeIds(i)) // We arbitrarily choose the smallest node id
           val toReindex = sourceIndexes.filter { (i) => !valFPG.infoOfNode(homeNodeIds(i)).isDefined } // nodes shouldn't already be in the FPG
           toReindex.foreach((i) => {
-            nodeFPG.recordInfo(homeNodeIds(i), homeNodeIds(smallestSourceIdx))
-            valFPG.recordInfo(homeNodeIds(i), numSteps)
+            if (i != smallestSourceIdx) {
+              assert (homeNodeIds(i) != homeNodeIds(smallestSourceIdx))
+              nodeFPG.recordInfo(homeNodeIds(i), homeNodeIds(smallestSourceIdx))
+              valFPG.recordInfo(homeNodeIds(i), numSteps)
+            }
           })
           // only the walk with smallest source is allowed to pursue
-          val walksBefore = walks.filter(_ != -1).size
           sourceIndexes foreach { (i) => if (i != smallestSourceIdx) walks(i) = -1 }
-          val walksAfter = walks.filter(_ != -1).size
-          coalesced += (walksBefore - walksAfter)
         case _ => {}
       }
-      printf("\n Coalesced %s walks which fused with others.", coalesced)
     }
     private var hasRun = false
     def run(): (IntInfoKeeper, IntInfoKeeper) = {
@@ -78,7 +72,7 @@ object ParallelRandomWalk {
           coalesceStep(walks, stepsTaken)
           stepsTaken += 1
           allFinished = walks.forall(_ == -1)
-          printf("\n Finished step %s.", stepsTaken)
+          printf("\n Finished step %s. %s walks still open", stepsTaken, walks.filter(_ != -1).size)
         }
         hasRun = true
         printf("\n The current walk took %s steps", stepsTaken)
@@ -186,19 +180,27 @@ object ParallelRandomWalk {
       def findLastNodeValue(nodeTable: IntInfoKeeper, valueTable: IntInfoKeeper, sourceNode: Int, stopNode: Int): Option[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
         if (!next.isDefined || next.get == -1) None
-        else if (next.get == stopNode) valueTable.infoOfNode(sourceNode)
-        else findLastNodeValue(nodeTable, valueTable, next.get, stopNode)
+        else {
+          assert(next.get != sourceNode)
+          if (next.get == stopNode) valueTable.infoOfNode(sourceNode)
+          else findLastNodeValue(nodeTable, valueTable, next.get, stopNode)
+        }
       }
 
       @tailrec
       def findPath(nodeTable: IntInfoKeeper, sourceNode: Int, res:List[Int] = Nil): List[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
         if (!next.isDefined || next.get == -1 || res.size > 100) res
-        else findPath(nodeTable, next.get, sourceNode :: res)
+        else {
+          assert(sourceNode != next.get)
+          findPath(nodeTable, next.get, sourceNode :: res)
+        }
       }
 
       nodeFPG.infoAllNodes foreach {
         case (nodeId, parentId) =>
+          assert(parentId != nodeId)
+          assert(parentId < nodeId)
           rootsUF.union(nodeId, parentId)
 
           // the first node has no parent to attach to
@@ -246,7 +248,7 @@ object ParallelRandomWalk {
                 }
               if (distance.isDefined) dMap(productFromComponents(a, b)) = distance.get
             }
-            else {
+            else if (false) {
               printf("\nInvestigating non-meet between %s and %s", a, b)
               assert(idToNode.contains(a))
               assert(idToNode.contains(b))
@@ -296,9 +298,7 @@ object ParallelRandomWalk {
       walksDone += 1
     }
 
-    //val traversedNodes = new RandomBoundedTraverser(graph, walkParams.dir, cleanStartNodes, walkParams.numSteps, walkParams)
-   //traversedNodes.foreach{ (node) => visits += 1}
-    val duration = elapsed()
+     val duration = elapsed()
     printf("\nDrunk mob made %s walks in %s ms:\n", walksDone, duration.inMillis.toInt)
 
   }
