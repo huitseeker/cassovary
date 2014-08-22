@@ -174,7 +174,7 @@ object ParallelRandomWalks {
     def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
     def pairFromLong(l: Long) = ((l >>32).toInt, l.toInt)
 
-    def runLCA(P: Iterator[Long], uId: Int, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode], uf: UnionFind[Int]): Unit = {
+    def runLCA(P: => Iterator[Long], uId: Int, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode], uf: UnionFind[Int]): Unit = {
       val u = idToNode(uId)
       uf.find(uId)
       u.ancestor = Some(uId)
@@ -286,10 +286,10 @@ object ParallelRandomWalks {
           def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList.sorted)
           if (debug) {
             val seenIdsSize = seenIds(List(idToNode(rId))).size
-            def expectedDistances(n: Int) = (n * (n-1)) / 2
-            assert (soughtPairs.size == expectedDistances(seenIdsSize))
+            def expectedDistances(n: Int) = (n * (n - 1)) / 2
+            assert(soughtPairs.size == expectedDistances(seenIdsSize))
+            assert(soughtPairs.forall(pairFromLong(_) match { case (a, b) => idToNode.get(a).isDefined && idToNode.get(b).isDefined }))
           }
-          if (debug) assert(soughtPairs.forall(pairFromLong(_) match { case (a,b) => idToNode.get(a).isDefined && idToNode.get(b).isDefined}))
           val uf = new UnionFind[Int]()
           runLCA(soughtPairs, rId, lcaMap, idToNode, uf)
           assert(uf.size() == seenIds(List(idToNode(rId))).size)
@@ -299,8 +299,10 @@ object ParallelRandomWalks {
               idToNode(id).coloured
             })
           }
-          if (debug) lcaAdded += lcaMap.size()
-          if (false) assert(lcaAdded == soughtPairs.size)
+          if (debug) {
+            lcaAdded += lcaMap.size()
+            assert(lcaAdded == soughtPairs.size)
+          }
         }
       }
       if (debug) printf("\n The LCA map records %s intersections, expected to account for %s distances.", lcaMap.size, pairsExpected)
