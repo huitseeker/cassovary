@@ -92,23 +92,18 @@ object ParallelRandomWalk {
     }
 
     class UnionFind[T]() {
-      private val parent: mutable.Map[T, T] = new mutable.HashMap[T, T] {
-        override def default(s: T) = {
-          get(s) match {
-            case Some(v) => v
-            case None => put(s, s); s
-          }
-        }
+
+      /**
+       * Create the set for a given node
+       */
+      def makeSet(s: T) = {
+        parent.put(s,s)
+        rank.put(s,1)
       }
 
-      private val rank: mutable.Map[T, Int] = new mutable.HashMap[T, Int] {
-        override def default(s: T) = {
-          get(s) match {
-            case Some(v) => v
-            case None => put(s, 1); 1
-          }
-        }
-      }
+      private val parent: mutable.Map[T, T] = new mutable.HashMap[T, T] ()
+
+      private val rank: mutable.Map[T, Int] = new mutable.HashMap[T, Int]()
 
       /**
        * Return the parent (representant) of the equivalence class.
@@ -144,26 +139,39 @@ object ParallelRandomWalk {
 
     }
 
-    sealed trait Tree
-    case class TreeNode(val id: Int, var children: List[Int], var coloured: Boolean, var ancestor: Option[TreeNode]) extends Tree
+    case class TreeNode(val id: Int, var children: List[Int], var coloured: Boolean, var ancestor: Option[TreeNode])
 
     val uf = new UnionFind[Int]()
 
-    @tailrec
-    private def allPairs(l: List[Int], res: List[Long]): List[Long] = l match {
-      case Nil => res
-      case x :: Nil => res
-      case x:: xs => allPairs(xs, (for (y <- xs) yield productFromComponents(x, y)) ++ res)
+    // Let's build an Iterator for this one, so as not to store it in memory
+    private def pairsAsLongIterator(l: List[Int]): Iterator[Long] = new Iterator[Long] {
+      var unusedHeads: List[Int] = if (l.isEmpty) Nil else l.tail
+      var chosenHeadList: List[Long] = if (l.isEmpty) Nil else for (y <- l.tail) yield productFromComponents(l.head, y)
+      override def hasNext(): Boolean = {
+        !(chosenHeadList.isEmpty && unusedHeads.size <= 1)
+      }
+      override def next(): Long = {
+        if (chosenHeadList.isEmpty){
+          // unusedHeads nonEmpty
+          val x = unusedHeads.head
+          chosenHeadList = for (y <- unusedHeads.tail) yield productFromComponents(x, y)
+          unusedHeads = unusedHeads.tail
+        }
+        val res = chosenHeadList.head
+        chosenHeadList = chosenHeadList.tail
+        res
+      }
+
     }
 
     // Encode info about pairs of Ints as Longs
     def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
-    def leftFromProduct(l: Long) = (l >> 32).toInt
-    def rightFromProduct(l: Long) = l.toInt
-    def pairFromProduct(l: Long) = ((l >>32).toInt, l.toInt)
+    def leftFromLong(l: Long) = (l >> 32).toInt
+    def rightFromLong(l: Long) = l.toInt
+    def pairFromLong(l: Long) = ((l >>32).toInt, l.toInt)
 
-    def runLCA(P: List[Long], u: TreeNode, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode]): Unit = {
-      uf.find(u.id)
+    def runLCA(P: Iterator[Long], u: TreeNode, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode]): Unit = {
+      uf.makeSet(u.id)
       u.ancestor = Some(u)
       u.children foreach { node =>
         runLCA(P, idToNode(node), lcaMap, idToNode)
@@ -171,12 +179,9 @@ object ParallelRandomWalk {
         idToNode(uf.find(u.id)).ancestor = Some(u)
         u.coloured = true
       }
-      P.filter{ pairFromProduct(_) match {
-        case(a, b) => a == u.id && idToNode(b).coloured
-        }
-      } foreach { pairFromProduct(_) match {
+      P foreach { pairFromLong(_) match {
           case (a,b) =>
-            lcaMap(productFromComponents(a, b)) = idToNode(uf.find(b)).ancestor.get.id
+            if (a == u.id && idToNode(b).coloured) lcaMap(productFromComponents(a, b)) = idToNode(uf.find(b)).ancestor.get.id
         }
       }
     }
@@ -189,6 +194,7 @@ object ParallelRandomWalk {
 
       val idToNode = new mutable.HashMap[Int, TreeNode]()
 
+      @tailrec
       def findLastEdgeValue(nodeTable: IntInfoKeeper, valueTable: IntInfoKeeper, sourceNode: Int, stopNode: Int): Option[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
         if (!next.isDefined) None
@@ -197,6 +203,12 @@ object ParallelRandomWalk {
           if (next.get == stopNode) valueTable.infoOfNode(sourceNode)
           else findLastEdgeValue(nodeTable, valueTable, next.get, stopNode)
         }
+      }
+
+      @tailrec
+      def seenIds(l: List[TreeNode], seen: Set[Int] = Set()): Set[Int] = l match {
+        case Nil => seen
+        case t :: ts => seenIds(ts ++ t.children.map(idToNode(_)), seen + t.id)
       }
 
       @tailrec
@@ -220,36 +232,32 @@ object ParallelRandomWalk {
           if (!idToNode.contains(nodeId)) idToNode(nodeId) = TreeNode(nodeId, List(), false, None)
       }
 
-      // I tried using an UF for those, but there must be some weird interaction with IntInfoKeepers
+      // Do not use an UF 'naively' here : it may give you the correct component, but may not give you the root as its class' representant
       val childrenIds = idToNode.values.flatMap{(n) => n.children}.toSet
       val rootIds = (idToNode.keys.toSet &~ childrenIds)
 
-      // Debug printing for Tree construction
+      // DEBUG printing for Tree construction
       if (debug) {
         printf("\nThe FPG contains %s nodes in %s connected components.", nodeFPG.infoAllNodes.keys.size(), rootIds.size)
 
-        @tailrec
-        def seenIds(l: List[TreeNode], seen: Set[Int] = Set()): Set[Int] = l match {
-          case Nil => seen
-          case t :: ts => seenIds(ts ++ t.children.map(idToNode(_)), seen + t.id)
-        }
-
         val seenFromRoots = seenIds(rootIds.map(idToNode(_)).toList)
         val notSeen = (idToNode.keys.toSet &~ seenFromRoots)
-        printf("\n\t BUG: %s nodes not seen from Roots.", notSeen.size)
+
         if (notSeen.nonEmpty) {
+          printf("\n\t BUG: %s nodes not seen from Roots.", notSeen.size)
           val rng = new Random
           val indices = List.tabulate(10)((n) => rng.nextInt(notSeen.size))
           for (i <- indices)
             printf("\n\t Example problematic path: source %s, path %s", notSeen.toList(i), findPath(nodeFPG, notSeen.toList(i)).map { (node) => (node, idToNode(node).children.sorted) }.toString())
         }
       }
+      // END DEBUG
 
       val lcaMap = new Long2IntOpenHashMap()
       val base = homeNodeIds filter {idToNode.contains(_)} take 100
-      lazy val pairs = allPairs(base.toList, List())
+      def pairs = pairsAsLongIterator(base.toList)
 
-      // Debug printing for tree construction
+      // DEBUG printing for tree construction
       if (debug) {
         @tailrec
         def treeCount(l: List[TreeNode], nodesSeen: Int = 0): Int = l match {
@@ -259,18 +267,24 @@ object ParallelRandomWalk {
 
         // the roots are in the node table, yet are not listed in nodeFPG (they have no parent)
         printf("\nThe Node table contains %s nodes, expected %s.", idToNode.keys.size, nodeFPG.infoAllNodes.keys.size() + rootIds.size)
-        printf("\nThe Node table contains %s children.", idToNode.values.map((node) => node.children.size).sum)
-        printf("\nThe FPG tree contains %s nodes, expected %s", treeCount(rootIds.map(idToNode(_)).toList), nodeFPG.infoAllNodes.keys.size() + rootIds.size)
+        printf("\nThe Node table contains %s children, expected %s.", idToNode.values.map((node) => node.children.size).sum, nodeFPG.infoAllNodes.keys.size())
+        printf("\nThe FPG tree contains %s nodes, expected %s.", treeCount(rootIds.map(idToNode(_)).toList), nodeFPG.infoAllNodes.keys.size() + rootIds.size)
       }
+      // END DEBUG
 
       rootIds foreach { rId =>
-        runLCA(pairs, idToNode(rId), lcaMap, idToNode)
+        var lcaAdded = 0
+        if (debug) lcaAdded -= lcaMap.size()
+        def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList)
+        runLCA(soughtPairs, idToNode(rId), lcaMap, idToNode)
+        if (debug) lcaAdded += lcaMap.size()
+        if (false) assert(lcaAdded == soughtPairs.size)
       }
 
       var expected = 0
       var missed = 0
       pairs foreach {
-        pairFromProduct(_) match {
+        pairFromLong(_) match {
           case (a, b) =>
             if (lcaMap.containsKey(productFromComponents(a,b))) {
             // They meet !
