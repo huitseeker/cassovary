@@ -20,14 +20,15 @@ import com.twitter.cassovary.graph.NodeUtils
 import scala.collection.mutable
 import scala.annotation.tailrec
 import scala.collection.breakOut
-import it.unimi.dsi.fastutil.longs.{Long2IntMap, Long2IntOpenHashMap}
+import scala.math.exp
+import it.unimi.dsi.fastutil.longs.{Long2IntMap, Long2DoubleMap, Long2DoubleOpenHashMap, Long2IntOpenHashMap}
 
 object ParallelRandomWalks {
 
   class DrunkardMobTraverser(graph: Graph, dir: GraphDir, homeNodeIds: Array[Int],
     maxSteps: Int, randNumGen: Random = new Random) {
 
-    val debug = true
+    val debug = false
 
     // a map from a node index to their parent in the FPG graph
     val nodeFPG = new IntInfoKeeper(false)
@@ -192,8 +193,7 @@ object ParallelRandomWalks {
       }
     }
 
-    def buildDistances(watch: Stopwatch.Elapsed): (Long2IntMap, Int) = {
-      val dMap = new Long2IntOpenHashMap()
+    def buildDistances(watch: Stopwatch.Elapsed, dMap: Long2DoubleMap, decay: Double): (Int) = {
 
       val (nodeFPG, valFPG) = run()
       if (debug) printf("\nFinished building the FPG at %s milis. It holds %s nodes (expected %s).", watch().inMillis.toInt, nodeFPG.infoAllNodes.values.size(), homeNodeIds.size - nonCoalesced)
@@ -260,8 +260,7 @@ object ParallelRandomWalks {
       // END DEBUG
 
       val lcaMap = new Long2IntOpenHashMap()
-      val base = homeNodeIds filter {idToNode.contains(_)} take 100
-      def pairs = pairsAsLongIterator(base.sorted.toList)
+      val base = rootIds.map{(rId) => seenIds(List(idToNode(rId))).toList}.filter( _.size > 1)
 
       // DEBUG printing for tree construction
       if (debug) {
@@ -309,41 +308,46 @@ object ParallelRandomWalks {
 
       var expected = 0
       var missed = 0
-      pairs foreach {
-        pairFromLong(_) match {
-          case (a, b) =>
-            if (lcaMap.containsKey(productFromComponents(a,b))) {
-            // They meet !
-              val lcaNodeId = lcaMap.get(productFromComponents(a, b))
+      base foreach {
+        pairsAsLongIterator(_) foreach {
+          pairFromLong(_) match {
+            case (a, b) =>
+              if (lcaMap.containsKey(productFromComponents(a, b))) {
+                // They meet !
+                val lcaNodeId = lcaMap.get(productFromComponents(a, b))
 
-              expected += 1
-              val distance: Option[Int] =
-                if (lcaNodeId == a) findLastEdgeValue(nodeFPG, valFPG, b, a)
-                else if (lcaNodeId == b) findLastEdgeValue(nodeFPG, valFPG, a, b)
-                else {
-                  val left = findLastEdgeValue(nodeFPG, valFPG, a, lcaNodeId)
-                  val right = findLastEdgeValue(nodeFPG, valFPG, b, lcaNodeId)
-                  (left, right) match {
-                    case (Some(x), Some(y)) => Some(x max y)
-                    case (x, None) => x
-                    case (None, y) => y
+                expected += 1
+                val distance: Option[Int] =
+                  if (lcaNodeId == a) findLastEdgeValue(nodeFPG, valFPG, b, a)
+                  else if (lcaNodeId == b) findLastEdgeValue(nodeFPG, valFPG, a, b)
+                  else {
+                    val left = findLastEdgeValue(nodeFPG, valFPG, a, lcaNodeId)
+                    val right = findLastEdgeValue(nodeFPG, valFPG, b, lcaNodeId)
+                    (left, right) match {
+                      case (Some(x), Some(y)) => Some(x max y)
+                      case (x, None) => x
+                      case (None, y) => y
+                    }
                   }
+                if (distance.isDefined){
+                  val key = productFromComponents(a, b)
+                  val base: Double = if (dMap.containsKey(key)) dMap(key) else 0
+                  dMap(key) = base + (math.pow(decay, distance.get) / maxSteps)
                 }
-              if (distance.isDefined) dMap(productFromComponents(a, b)) = distance.get
-            }
-            else if (debug) {
-              // printf("\nInvestigating non-meet between %s and %s", a, b)
-              assert(idToNode.contains(a))
-              assert(idToNode.contains(b))
-              val leftPath = findPath(nodeFPG, a)
-              val rightPath = findPath(nodeFPG, b)
-              if (leftPath.toSet.intersect(rightPath.toSet).nonEmpty) missed += 1
-            }
+              } else if (debug) {
+                // printf("\nInvestigating non-meet between %s and %s", a, b)
+                assert(idToNode.contains(a))
+                assert(idToNode.contains(b))
+                val leftPath = findPath(nodeFPG, a)
+                val rightPath = findPath(nodeFPG, b)
+                if (leftPath.toSet.intersect(rightPath.toSet).nonEmpty) missed += 1
+              }
+          }
         }
       }
       if (debug && missed > 0) printf("\n\t BUG in the LCA algorithm ! Missed %s intersections", missed)
 
-      (dMap, expected)
+      (expected)
     }
 
   }
@@ -364,6 +368,7 @@ object ParallelRandomWalks {
     val cleanStartNodes = startNodes.filter( (node) => graph.getNodeById(node).isDefined )
 
     val maxSteps = 100
+    val decay: Double = 0.8
 
     val graphUtils = new GraphUtils(graph)
     printf("\n Now doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
@@ -374,8 +379,10 @@ object ParallelRandomWalks {
     var walksDone = 0
     while (walksDone < maxWalks) {
       printf("\nStarting walk %s. Expecting %s nodes to walk.", walksDone, cleanStartNodes.size)
-      val (distanceMap,expectedN) = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed)
-      printf("\nWalk number %s computed %s distances.", walksDone, expectedN)
+      val oldTime = elapsed()
+      val dMap = new Long2DoubleOpenHashMap()
+      val expectedN = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed, dMap, decay)
+      printf("\nWalk number %s computed %s distances in %s milis.", walksDone, expectedN, (elapsed()-oldTime).inMillis.toInt)
       walksDone += 1
       if (walksDone % 5 == 0) assert(false)
     }
