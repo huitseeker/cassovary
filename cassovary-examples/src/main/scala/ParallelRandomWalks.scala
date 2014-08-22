@@ -17,14 +17,16 @@ import com.twitter.cassovary.graph.Traverser
 import scala.util.Random
 import com.twitter.cassovary.graph.Node
 import com.twitter.cassovary.graph.NodeUtils
-import scala.collection.mutable.HashMap
-import scala.collection.mutable.Map
+import scala.collection.mutable
 import scala.annotation.tailrec
+import it.unimi.dsi.fastutil.longs.{Long2IntMap, Long2IntOpenHashMap}
 
 object ParallelRandomWalk {
 
   class DrunkardMobTraverser(graph: Graph, dir: GraphDir, homeNodeIds: Array[Int],
     maxSteps: Int, randNumGen: Random = new Random) {
+
+    val debug = true
 
     // a map from a node index to their parent in the FPG graph
     val nodeFPG = new IntInfoKeeper(false)
@@ -70,24 +72,27 @@ object ParallelRandomWalk {
       if (!hasRun) {
         var stepsTaken = 0
         var allFinished = false
+        var walksCounter = 0
         while (stepsTaken < maxSteps && !allFinished) {
-          val walksBefore = walks.filter(_ != -1).size
+          if (debug) walksCounter = walks.filter(_ != -1).size
           takeRandomStep(walks)
-          val walksAfter = walks.filter(_ != -1).size
-          nonCoalesced += walksBefore - walksAfter
+          if (debug) walksCounter -= walks.filter(_ != -1).size
+          if (debug) nonCoalesced += walksCounter
           coalesceStep(walks, stepsTaken)
           stepsTaken += 1
           allFinished = walks.forall(_ == -1)
         }
-        nonCoalesced += walks.filter(_ != -1).size
-        printf("\nAt end of walk, %s walkers still walking", walks.filter(_ != -1).size)
+        if (debug) {
+          nonCoalesced += walks.filter(_ != -1).size
+          printf("\nAt end of walk, %s walkers still walking", walks.filter(_ != -1).size)
+        }
         hasRun = true
       }
       (nodeFPG, valFPG)
     }
 
     class UnionFind[T]() {
-      private val parent: Map[T, T] = new HashMap[T, T] {
+      private val parent: mutable.Map[T, T] = new mutable.HashMap[T, T] {
         override def default(s: T) = {
           get(s) match {
             case Some(v) => v
@@ -96,7 +101,7 @@ object ParallelRandomWalk {
         }
       }
 
-      private val rank: Map[T, Int] = new HashMap[T, Int] {
+      private val rank: mutable.Map[T, Int] = new mutable.HashMap[T, Int] {
         override def default(s: T) = {
           get(s) match {
             case Some(v) => v
@@ -140,7 +145,7 @@ object ParallelRandomWalk {
     }
 
     sealed trait Tree
-    case class TreeNode(val id: Int, var children: List[TreeNode], var coloured: Boolean, var ancestor: Option[TreeNode]) extends Tree
+    case class TreeNode(val id: Int, var children: List[Int], var coloured: Boolean, var ancestor: Option[TreeNode]) extends Tree
 
     val uf = new UnionFind[Int]()
 
@@ -151,17 +156,18 @@ object ParallelRandomWalk {
       case x:: xs => allPairs(xs, (for (y <- xs) yield productFromComponents(x, y)) ++ res)
     }
 
+    // Encode info about pairs of Ints as Longs
     def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
     def leftFromProduct(l: Long) = (l >> 32).toInt
     def rightFromProduct(l: Long) = l.toInt
     def pairFromProduct(l: Long) = ((l >>32).toInt, l.toInt)
 
-    def runLCA(P: List[Long], u: TreeNode, lcaMap: Map[Long, Int], idToNode:Map[Int, TreeNode]): Unit = {
+    def runLCA(P: List[Long], u: TreeNode, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode]): Unit = {
       uf.find(u.id)
       u.ancestor = Some(u)
       u.children foreach { node =>
-        runLCA(P, node, lcaMap, idToNode)
-        uf.union(u.id, node.id)
+        runLCA(P, idToNode(node), lcaMap, idToNode)
+        uf.union(u.id, node)
         idToNode(uf.find(u.id)).ancestor = Some(u)
         u.coloured = true
       }
@@ -175,31 +181,30 @@ object ParallelRandomWalk {
       }
     }
 
-    def buildDistances(watch: Stopwatch.Elapsed): (Map[Long, Int], Int) = {
-      val dMap = new HashMap[Long, Int]()
+    def buildDistances(watch: Stopwatch.Elapsed): (Long2IntMap, Int) = {
+      val dMap = new Long2IntOpenHashMap()
 
       val (nodeFPG, valFPG) = run()
-      printf("\nFinished building the FPG at %s milis. It holds %s nodes (expected %s).", watch().inMillis.toInt, nodeFPG.infoAllNodes.values.size(), homeNodeIds.size - nonCoalesced)
+      if (debug) printf("\nFinished building the FPG at %s milis. It holds %s nodes (expected %s).", watch().inMillis.toInt, nodeFPG.infoAllNodes.values.size(), homeNodeIds.size - nonCoalesced)
 
-      val rootsUF = new UnionFind[Int]()
+      val idToNode = new mutable.HashMap[Int, TreeNode]()
 
-      val idToNode = new HashMap[Int, TreeNode]()
-
-      def findLastNodeValue(nodeTable: IntInfoKeeper, valueTable: IntInfoKeeper, sourceNode: Int, stopNode: Int): Option[Int] = {
+      def findLastEdgeValue(nodeTable: IntInfoKeeper, valueTable: IntInfoKeeper, sourceNode: Int, stopNode: Int): Option[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
-        if (!next.isDefined || next.get == -1) None
+        if (!next.isDefined) None
         else {
           assert(next.get != sourceNode)
           if (next.get == stopNode) valueTable.infoOfNode(sourceNode)
-          else findLastNodeValue(nodeTable, valueTable, next.get, stopNode)
+          else findLastEdgeValue(nodeTable, valueTable, next.get, stopNode)
         }
       }
 
       @tailrec
       def findPath(nodeTable: IntInfoKeeper, sourceNode: Int, res:List[Int] = Nil): List[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
-        if (!next.isDefined || next.get == -1 || res.size > 100) res
+        if (!next.isDefined || res.size > 100) sourceNode :: res
         else {
+          assert(next.get != -1)
           assert(sourceNode != next.get)
           findPath(nodeTable, next.get, sourceNode :: res)
         }
@@ -209,30 +214,54 @@ object ParallelRandomWalk {
         case (nodeId, parentId) =>
           assert(parentId != nodeId)
           assert(parentId < nodeId)
-          if (parentId != -1) rootsUF.union(nodeId, parentId)
-
           // the first node has no parent to attach to
           if (!idToNode.contains(parentId)) idToNode(parentId) = TreeNode(parentId, List(), false, None)
-          val parentNode = idToNode(parentId)
-          val childNode = TreeNode(nodeId, List(), false, None)
-          parentNode.children = childNode :: parentNode.children
-          // you never see a node twice
-          idToNode(nodeId) = childNode
+          idToNode(parentId).children = nodeId :: idToNode(parentId).children
+          if (!idToNode.contains(nodeId)) idToNode(nodeId) = TreeNode(nodeId, List(), false, None)
       }
 
-      val rootIds = (homeNodeIds map { (id) => rootsUF.find(id) } toSet) filter {(id) => idToNode.contains(id)}
-      printf("\nThe FPG contains %s nodes in %s connected components.", nodeFPG.infoAllNodes.keys.size(), rootIds.size)
+      // I tried using an UF for those, but there must be some weird interaction with IntInfoKeepers
+      val childrenIds = idToNode.values.flatMap{(n) => n.children}.toSet
+      val rootIds = (idToNode.keys.toSet &~ childrenIds)
 
-      val lcaMap = new HashMap[Long, Int]()
+      // Debug printing for Tree construction
+      if (debug) {
+        printf("\nThe FPG contains %s nodes in %s connected components.", nodeFPG.infoAllNodes.keys.size(), rootIds.size)
+
+        @tailrec
+        def seenIds(l: List[TreeNode], seen: Set[Int] = Set()): Set[Int] = l match {
+          case Nil => seen
+          case t :: ts => seenIds(ts ++ t.children.map(idToNode(_)), seen + t.id)
+        }
+
+        val seenFromRoots = seenIds(rootIds.map(idToNode(_)).toList)
+        val notSeen = (idToNode.keys.toSet &~ seenFromRoots)
+        printf("\n\t BUG: %s nodes not seen from Roots.", notSeen.size)
+        if (notSeen.nonEmpty) {
+          val rng = new Random
+          val indices = List.tabulate(10)((n) => rng.nextInt(notSeen.size))
+          for (i <- indices)
+            printf("\n\t Example problematic path: source %s, path %s", notSeen.toList(i), findPath(nodeFPG, notSeen.toList(i)).map { (node) => (node, idToNode(node).children.sorted) }.toString())
+        }
+      }
+
+      val lcaMap = new Long2IntOpenHashMap()
       val base = homeNodeIds filter {idToNode.contains(_)} take 100
       lazy val pairs = allPairs(base.toList, List())
 
-      def treeCount(l: List[TreeNode]): Int = l match {
-        case Nil => 0
-        case t :: ts => 1 + treeCount(ts ++ t.children)
-      }
+      // Debug printing for tree construction
+      if (debug) {
+        @tailrec
+        def treeCount(l: List[TreeNode], nodesSeen: Int = 0): Int = l match {
+          case Nil => nodesSeen
+          case t :: ts => treeCount(ts ++ t.children.map(idToNode(_)), nodesSeen + 1)
+        }
 
-      printf("\nThe FPG tree contains %s nodes, expected %s", treeCount(rootIds.map(idToNode(_)).toList), nodeFPG.infoAllNodes.keys.size())
+        // the roots are in the node table, yet are not listed in nodeFPG (they have no parent)
+        printf("\nThe Node table contains %s nodes, expected %s.", idToNode.keys.size, nodeFPG.infoAllNodes.keys.size() + rootIds.size)
+        printf("\nThe Node table contains %s children.", idToNode.values.map((node) => node.children.size).sum)
+        printf("\nThe FPG tree contains %s nodes, expected %s", treeCount(rootIds.map(idToNode(_)).toList), nodeFPG.infoAllNodes.keys.size() + rootIds.size)
+      }
 
       rootIds foreach { rId =>
         runLCA(pairs, idToNode(rId), lcaMap, idToNode)
@@ -243,16 +272,17 @@ object ParallelRandomWalk {
       pairs foreach {
         pairFromProduct(_) match {
           case (a, b) =>
-            val lcaNodeId = lcaMap.get(productFromComponents(a, b))
-            if (lcaNodeId.isDefined) {
-              // They meet !
+            if (lcaMap.containsKey(productFromComponents(a,b))) {
+            // They meet !
+              val lcaNodeId = lcaMap.get(productFromComponents(a, b))
+
               expected += 1
               val distance: Option[Int] =
-                if (lcaNodeId.get == a) findLastNodeValue(nodeFPG, valFPG, b, a)
-                else if (lcaNodeId.get == b) findLastNodeValue(nodeFPG, valFPG, a, b)
+                if (lcaNodeId == a) findLastEdgeValue(nodeFPG, valFPG, b, a)
+                else if (lcaNodeId == b) findLastEdgeValue(nodeFPG, valFPG, a, b)
                 else {
-                  val left = findLastNodeValue(nodeFPG, valFPG, a, lcaNodeId.get)
-                  val right = findLastNodeValue(nodeFPG, valFPG, b, lcaNodeId.get)
+                  val left = findLastEdgeValue(nodeFPG, valFPG, a, lcaNodeId)
+                  val right = findLastEdgeValue(nodeFPG, valFPG, b, lcaNodeId)
                   (left, right) match {
                     case (Some(x), Some(y)) => Some(x max y)
                     case (x, None) => x
@@ -261,7 +291,7 @@ object ParallelRandomWalk {
                 }
               if (distance.isDefined) dMap(productFromComponents(a, b)) = distance.get
             }
-            else {
+            else if (debug) {
               // printf("\nInvestigating non-meet between %s and %s", a, b)
               assert(idToNode.contains(a))
               assert(idToNode.contains(b))
@@ -271,7 +301,7 @@ object ParallelRandomWalk {
             }
         }
       }
-      if (missed > 0) printf("\n BUG in the LCA algorithm ! Missed %s intersections", missed)
+      if (debug && missed > 0) printf("\n\t BUG in the LCA algorithm ! Missed %s intersections", missed)
 
       (dMap, expected)
     }
@@ -300,14 +330,13 @@ object ParallelRandomWalk {
 
 
     val elapsed = Stopwatch.start()
-    printf("\nWe have %s starting nodes from %s to %s", startNodes.size, startNodes.min, startNodes.max)
     val maxWalks = 100
     var walksDone = 0
     while (walksDone < maxWalks) {
       printf("\nStarting walk %s. Expecting %s nodes to walk.", walksDone, cleanStartNodes.size)
       val (distanceMap,expectedN) = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed)
       def expectedDistances(n: Int) = (n * (n+1)) / 2
-      printf("\nWalk number %s computed %s distances out of an expected %s", walksDone, expectedN, expectedDistances(100))
+      printf("\nWalk number %s computed %s distances out of an expected possible %s", walksDone, expectedN, expectedDistances(100))
       walksDone += 1
     }
 
