@@ -19,9 +19,10 @@ import com.twitter.cassovary.graph.Node
 import com.twitter.cassovary.graph.NodeUtils
 import scala.collection.mutable
 import scala.annotation.tailrec
+import scala.collection.breakOut
 import it.unimi.dsi.fastutil.longs.{Long2IntMap, Long2IntOpenHashMap}
 
-object ParallelRandomWalk {
+object ParallelRandomWalks {
 
   class DrunkardMobTraverser(graph: Graph, dir: GraphDir, homeNodeIds: Array[Int],
     maxSteps: Int, randNumGen: Random = new Random) {
@@ -93,17 +94,25 @@ object ParallelRandomWalk {
 
     class UnionFind[T]() {
 
-      /**
-       * Create the set for a given node
-       */
-      def makeSet(s: T) = {
-        parent.put(s,s)
-        rank.put(s,1)
+      private val parent: mutable.Map[T, T] = new mutable.HashMap[T, T] {
+        override def default(s: T) = {
+          get(s) match {
+            case Some(v) => v
+            case None => put(s, s); s
+          }
+        }
       }
 
-      private val parent: mutable.Map[T, T] = new mutable.HashMap[T, T] ()
+      private val rank: mutable.Map[T, Int] = new mutable.HashMap[T, Int] {
+        override def default(s: T) = {
+          get(s) match {
+            case Some(v) => v
+            case None => put(s, 1); 1
+          }
+        }
+      }
 
-      private val rank: mutable.Map[T, Int] = new mutable.HashMap[T, Int]()
+      def size(): Int = parent.keys.size
 
       /**
        * Return the parent (representant) of the equivalence class.
@@ -112,9 +121,8 @@ object ParallelRandomWalk {
       def find(s: T): T = {
         val ps = parent(s)
         if (ps == s) s else {
-          val cs = find(ps)
-          parent(s) = cs
-          cs
+          parent(s) = find(ps)
+          parent(s)
         }
       }
 
@@ -139,9 +147,7 @@ object ParallelRandomWalk {
 
     }
 
-    case class TreeNode(val id: Int, var children: List[Int], var coloured: Boolean, var ancestor: Option[TreeNode])
-
-    val uf = new UnionFind[Int]()
+    case class TreeNode(val id: Int, var children: List[Int], var coloured: Boolean, var ancestor: Option[Int])
 
     // Let's build an Iterator for this one, so as not to store it in memory
     private def pairsAsLongIterator(l: List[Int]): Iterator[Long] = new Iterator[Long] {
@@ -166,22 +172,22 @@ object ParallelRandomWalk {
 
     // Encode info about pairs of Ints as Longs
     def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
-    def leftFromLong(l: Long) = (l >> 32).toInt
-    def rightFromLong(l: Long) = l.toInt
     def pairFromLong(l: Long) = ((l >>32).toInt, l.toInt)
 
-    def runLCA(P: Iterator[Long], u: TreeNode, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode]): Unit = {
-      uf.makeSet(u.id)
-      u.ancestor = Some(u)
+    def runLCA(P: Iterator[Long], uId: Int, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode], uf: UnionFind[Int]): Unit = {
+      val u = idToNode(uId)
+      uf.find(uId)
+      u.ancestor = Some(uId)
       u.children foreach { node =>
-        runLCA(P, idToNode(node), lcaMap, idToNode)
-        uf.union(u.id, node)
-        idToNode(uf.find(u.id)).ancestor = Some(u)
-        u.coloured = true
+        runLCA(P, node, lcaMap, idToNode, uf)
+        uf.union(uId, node)
+        idToNode(uf.find(uId)).ancestor = Some(uId)
       }
+      u.coloured = true
       P foreach { pairFromLong(_) match {
           case (a,b) =>
-            if (a == u.id && idToNode(b).coloured) lcaMap(productFromComponents(a, b)) = idToNode(uf.find(b)).ancestor.get.id
+            if (a == uId && idToNode(b).coloured) lcaMap(productFromComponents((a min b), (a max b))) = idToNode(uf.find(b)).ancestor.get
+            if (b == uId && idToNode(a).coloured) lcaMap(productFromComponents((a min b), (a max b))) = idToNode(uf.find(a)).ancestor.get
         }
       }
     }
@@ -233,8 +239,8 @@ object ParallelRandomWalk {
       }
 
       // Do not use an UF 'naively' here : it may give you the correct component, but may not give you the root as its class' representant
-      val childrenIds = idToNode.values.flatMap{(n) => n.children}.toSet
-      val rootIds = (idToNode.keys.toSet &~ childrenIds)
+      val childrenIds = (nodeFPG.infoAllNodes.keys.map((x) => x:Int)).toSet
+      val rootIds = (idToNode.keys.toSet &~ childrenIds.toSet)
 
       // DEBUG printing for Tree construction
       if (debug) {
@@ -255,7 +261,7 @@ object ParallelRandomWalk {
 
       val lcaMap = new Long2IntOpenHashMap()
       val base = homeNodeIds filter {idToNode.contains(_)} take 100
-      def pairs = pairsAsLongIterator(base.toList)
+      def pairs = pairsAsLongIterator(base.sorted.toList)
 
       // DEBUG printing for tree construction
       if (debug) {
@@ -272,14 +278,32 @@ object ParallelRandomWalk {
       }
       // END DEBUG
 
+      var pairsExpected = 0
       rootIds foreach { rId =>
-        var lcaAdded = 0
-        if (debug) lcaAdded -= lcaMap.size()
-        def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList)
-        runLCA(soughtPairs, idToNode(rId), lcaMap, idToNode)
-        if (debug) lcaAdded += lcaMap.size()
-        if (false) assert(lcaAdded == soughtPairs.size)
+        if (seenIds(List(idToNode(rId))).size > 1) {
+          var lcaAdded = 0
+          if (debug) lcaAdded -= lcaMap.size()
+          def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList.sorted)
+          if (debug) {
+            val seenIdsSize = seenIds(List(idToNode(rId))).size
+            def expectedDistances(n: Int) = (n * (n-1)) / 2
+            assert (soughtPairs.size == expectedDistances(seenIdsSize))
+          }
+          if (debug) assert(soughtPairs.forall(pairFromLong(_) match { case (a,b) => idToNode.get(a).isDefined && idToNode.get(b).isDefined}))
+          val uf = new UnionFind[Int]()
+          runLCA(soughtPairs, rId, lcaMap, idToNode, uf)
+          assert(uf.size() == seenIds(List(idToNode(rId))).size)
+          pairsExpected += soughtPairs.size
+          if (debug) {
+            assert(seenIds(List(idToNode(rId))) forall { (id) =>
+              idToNode(id).coloured
+            })
+          }
+          if (debug) lcaAdded += lcaMap.size()
+          if (false) assert(lcaAdded == soughtPairs.size)
+        }
       }
+      if (debug) printf("\n The LCA map records %s intersections, expected to account for %s distances.", lcaMap.size, pairsExpected)
 
       var expected = 0
       var missed = 0
@@ -337,7 +361,7 @@ object ParallelRandomWalk {
     val startNodes = scala.io.Source.fromInputStream(startStream).getLines().map((x) => Integer.parseInt(x)).toSeq
     val cleanStartNodes = startNodes.filter( (node) => graph.getNodeById(node).isDefined )
 
-    val maxSteps = 500
+    val maxSteps = 100
 
     val graphUtils = new GraphUtils(graph)
     printf("\n Now doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
@@ -349,9 +373,9 @@ object ParallelRandomWalk {
     while (walksDone < maxWalks) {
       printf("\nStarting walk %s. Expecting %s nodes to walk.", walksDone, cleanStartNodes.size)
       val (distanceMap,expectedN) = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed)
-      def expectedDistances(n: Int) = (n * (n+1)) / 2
-      printf("\nWalk number %s computed %s distances out of an expected possible %s", walksDone, expectedN, expectedDistances(100))
+      printf("\nWalk number %s computed %s distances.", walksDone, expectedN)
       walksDone += 1
+      if (walksDone % 5 == 0) assert(false)
     }
 
      val duration = elapsed()
