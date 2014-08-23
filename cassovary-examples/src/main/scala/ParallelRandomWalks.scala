@@ -22,6 +22,11 @@ import scala.annotation.tailrec
 import scala.collection.breakOut
 import scala.math.exp
 import it.unimi.dsi.fastutil.longs.{Long2IntMap, Long2DoubleMap, Long2DoubleOpenHashMap, Long2IntOpenHashMap}
+import java.util.zip.GZIPOutputStream
+import java.io.BufferedOutputStream
+import java.io.FileOutputStream
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap
+import java.io.OutputStreamWriter
 
 object ParallelRandomWalks {
 
@@ -193,7 +198,7 @@ object ParallelRandomWalks {
       }
     }
 
-    def buildDistances(watch: Stopwatch.Elapsed, dMap: Long2DoubleMap, decay: Double): (Int) = {
+    def buildDistances(watch: Stopwatch.Elapsed, dMap: Long2DoubleMap, decay: Double, maxWalks: Int): (Int) = {
 
       val (nodeFPG, valFPG) = run()
       if (debug) printf("\nFinished building the FPG at %s milis. It holds %s nodes (expected %s).", watch().inMillis.toInt, nodeFPG.infoAllNodes.values.size(), homeNodeIds.size - nonCoalesced)
@@ -220,7 +225,7 @@ object ParallelRandomWalks {
       @tailrec
       def findPath(nodeTable: IntInfoKeeper, sourceNode: Int, res:List[Int] = Nil): List[Int] = {
         val next = nodeTable.infoOfNode(sourceNode)
-        if (!next.isDefined || res.size > 100) sourceNode :: res
+        if (!next.isDefined || res.size > 100) (sourceNode :: res).reverse
         else {
           assert(next.get != -1)
           assert(sourceNode != next.get)
@@ -254,13 +259,12 @@ object ParallelRandomWalks {
           val rng = new Random
           val indices = List.tabulate(10)((n) => rng.nextInt(notSeen.size))
           for (i <- indices)
-            printf("\n\t Example problematic path: source %s, path %s", notSeen.toList(i), findPath(nodeFPG, notSeen.toList(i)).map { (node) => (node, idToNode(node).children.sorted) }.toString())
+            printf("\n\t Example problematic path: source %s, path %s", notSeen.toList(i), findPath(nodeFPG, notSeen.toList(i)).map { (node) => (node, idToNode(node).children.sorted) }.mkString(" -> "))
         }
       }
       // END DEBUG
 
       val lcaMap = new Long2IntOpenHashMap()
-      val base = rootIds.map{(rId) => seenIds(List(idToNode(rId))).toList}.filter( _.size > 1)
 
       // DEBUG printing for tree construction
       if (debug) {
@@ -282,7 +286,7 @@ object ParallelRandomWalks {
         if (seenIds(List(idToNode(rId))).size > 1) {
           var lcaAdded = 0
           if (debug) lcaAdded -= lcaMap.size()
-          def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList.sorted)
+          def soughtPairs = pairsAsLongIterator(seenIds(List(idToNode(rId))).toList)
           if (debug) {
             val seenIdsSize = seenIds(List(idToNode(rId))).size
             def expectedDistances(n: Int) = (n * (n - 1)) / 2
@@ -292,11 +296,9 @@ object ParallelRandomWalks {
           val uf = new UnionFind[Int]()
           runLCA(soughtPairs, rId, lcaMap, idToNode, uf)
           assert(uf.size() == seenIds(List(idToNode(rId))).size)
-          pairsExpected += soughtPairs.size
           if (debug) {
-            assert(seenIds(List(idToNode(rId))) forall { (id) =>
-              idToNode(id).coloured
-            })
+            pairsExpected += soughtPairs.size
+            assert(seenIds(List(idToNode(rId))) forall { (id) => idToNode(id).coloured })
           }
           if (debug) {
             lcaAdded += lcaMap.size()
@@ -304,17 +306,30 @@ object ParallelRandomWalks {
           }
         }
       }
-      if (debug) printf("\n The LCA map records %s intersections, expected to account for %s distances.", lcaMap.size, pairsExpected)
+      if (debug) printf("\nThe LCA map records %s intersections, expected to account for %s distances.", lcaMap.size, pairsExpected)
+      val base = rootIds.map{(rId) => seenIds(List(idToNode(rId))).toList}.filter( _.size > 1)
 
       var expected = 0
+      // DEBUG variables
       var missed = 0
+      var distances = 0
+      var reached = 0
+      var smallestDebugPathLength = 200
+      var smallestLeftPath = List[Int]()
+      var smallestRightPath = List[Int]()
+      //END DEBUG
+
       base foreach {
+        // it's very important, here, to try both pairs : only one of those symmetric pairs
+        // is in the lcaMap, i.e. only one of (a, b) or (b, a). See soughtPair's iterator / runLCA.
         pairsAsLongIterator(_) foreach {
           pairFromLong(_) match {
             case (a, b) =>
-              if (lcaMap.containsKey(productFromComponents(a, b))) {
+              val orderedContain = lcaMap.containsKey(productFromComponents(a, b))
+              val reversedContain = lcaMap.containsKey(productFromComponents(b, a))
+              if ( orderedContain || reversedContain ) {
                 // They meet !
-                val lcaNodeId = lcaMap.get(productFromComponents(a, b))
+                val lcaNodeId = if (orderedContain) lcaMap.get(productFromComponents(a, b)) else lcaMap.get(productFromComponents(b, a))
 
                 expected += 1
                 val distance: Option[Int] =
@@ -332,7 +347,8 @@ object ParallelRandomWalks {
                 if (distance.isDefined){
                   val key = productFromComponents(a, b)
                   val base: Double = if (dMap.containsKey(key)) dMap(key) else 0
-                  dMap(key) = base + (math.pow(decay, distance.get) / maxSteps)
+                  if (debug) { distances += distance.get; reached += 1}
+                  dMap(key) = base + (math.pow(decay, distance.get) / maxWalks)
                 }
               } else if (debug) {
                 // printf("\nInvestigating non-meet between %s and %s", a, b)
@@ -340,12 +356,23 @@ object ParallelRandomWalks {
                 assert(idToNode.contains(b))
                 val leftPath = findPath(nodeFPG, a)
                 val rightPath = findPath(nodeFPG, b)
-                if (leftPath.toSet.intersect(rightPath.toSet).nonEmpty) missed += 1
+                if (leftPath.toSet.intersect(rightPath.toSet).nonEmpty) {
+                  missed += 1
+                  if (leftPath.size + rightPath.size < smallestDebugPathLength) {smallestLeftPath = leftPath; smallestRightPath = rightPath; smallestDebugPathLength = leftPath.size}
+                }
               }
           }
         }
       }
-      if (debug && missed > 0) printf("\n\t BUG in the LCA algorithm ! Missed %s intersections", missed)
+      if (debug && missed > 0) {
+        printf("\n\t BUG in the LCA algorithm ! Missed %s intersections", missed)
+        printf("\n \t Example problematic paths: \n %s \n and \n %s", smallestLeftPath.mkString(" -> "), smallestRightPath.mkString(" -> "))
+        if (smallestDebugPathLength == 2) {
+          printf("\n Whether %s is a root is %s", smallestLeftPath(1), rootIds.contains(smallestLeftPath(1)))
+          printf("\n The children of %s are %s", smallestLeftPath(1), idToNode(smallestLeftPath(1)).children)
+        }
+      }
+      if (debug) printf("\nThe average distance betw meeting websites is %s", (0.0 + distances) / reached)
 
       (expected)
     }
@@ -368,7 +395,7 @@ object ParallelRandomWalks {
     val cleanStartNodes = startNodes.filter( (node) => graph.getNodeById(node).isDefined )
 
     val maxSteps = 500
-    val decay: Double = 0.8
+    val decay: Double = 0.6
 
     val graphUtils = new GraphUtils(graph)
     printf("\nNow doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
@@ -382,7 +409,7 @@ object ParallelRandomWalks {
       printf("\nStarting walk %s.", walksDone)
       val oldTime = elapsed()
 
-      val expectedN = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed, dMap, decay)
+      val expectedN = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed, dMap, decay, maxWalks)
       printf("\nWalk number %s computed %s distances in %s milis.", walksDone, expectedN, (elapsed()-oldTime).inMillis.toInt)
       walksDone += 1
       //if (walksDone % 5 == 0) assert(false)
@@ -391,5 +418,25 @@ object ParallelRandomWalks {
     val duration = elapsed()
     printf("\nDrunk mob made %s walks in %s ms:\n", walksDone, duration.inMillis.toInt)
 
+    // we do this for every node in the initial walk sources file
+    val nodeToMatIdx = new Int2IntOpenHashMap()
+    startNodes.view.zipWithIndex foreach {
+      case (nodeIdx, matIdx) => nodeToMatIdx(nodeIdx) = matIdx
+    }
+
+    val oSWriter = new OutputStreamWriter(new GZIPOutputStream(new BufferedOutputStream(new FileOutputStream("/Users/huitseeker/tmp/Weve/hostgraph/simrank_websites.mtx.gz"))))
+    oSWriter.write("% %MatrixMarket matrix coordinate real symmetric\n")
+    oSWriter.write("% This is a SimRank distance matrix for the 2014 web crawl graph.\n")
+    oSWriter.write(s"% It was computed using $maxWalks random walks of length $maxSteps and a decay factor of $decay\n")
+    oSWriter.write(s"${startNodes.size} ${startNodes.size} ${dMap.size}\n")
+    dMap foreach {
+      case (l, value) => {
+                val (x,y) = ((l >>32).toInt, l.toInt)
+                val a = nodeToMatIdx(x).toInt
+                val b = nodeToMatIdx(y).toInt
+                oSWriter.write(s" ${(a max b) + 1} ${(a min b) +1} $value \n")
+      }
+    }
+    oSWriter.close()
   }
 }
