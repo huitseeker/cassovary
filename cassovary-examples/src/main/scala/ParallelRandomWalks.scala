@@ -172,10 +172,10 @@ object ParallelRandomWalks {
     }
 
     // Encode info about pairs of Ints as Longs
-    def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
-    def pairFromLong(l: Long) = ((l >>32).toInt, l.toInt)
+    private def productFromComponents(x: Int, y: Int) = ((x.toLong) << 32) | (y.toLong & 0xffffffffL)
+    private def pairFromLong(l: Long) = ((l >>32).toInt, l.toInt)
 
-    def runLCA(P: => Iterator[Long], uId: Int, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode], uf: UnionFind[Int]): Unit = {
+    private def runLCA(P: => Iterator[Long], uId: Int, lcaMap: Long2IntMap, idToNode: mutable.Map[Int, TreeNode], uf: UnionFind[Int]): Unit = {
       val u = idToNode(uId)
       uf.find(uId)
       u.ancestor = Some(uId)
@@ -367,27 +367,28 @@ object ParallelRandomWalks {
     val startNodes = scala.io.Source.fromInputStream(startStream).getLines().map((x) => Integer.parseInt(x)).toSeq
     val cleanStartNodes = startNodes.filter( (node) => graph.getNodeById(node).isDefined )
 
-    val maxSteps = 100
+    val maxSteps = 500
     val decay: Double = 0.8
 
     val graphUtils = new GraphUtils(graph)
-    printf("\n Now doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
+    printf("\nNow doing random walks of %s steps from %s Nodes...\n", maxSteps, cleanStartNodes.size)
 
 
     val elapsed = Stopwatch.start()
     val maxWalks = 100
     var walksDone = 0
+    val dMap = new Long2DoubleOpenHashMap()
     while (walksDone < maxWalks) {
-      printf("\nStarting walk %s. Expecting %s nodes to walk.", walksDone, cleanStartNodes.size)
+      printf("\nStarting walk %s.", walksDone)
       val oldTime = elapsed()
-      val dMap = new Long2DoubleOpenHashMap()
+
       val expectedN = (new DrunkardMobTraverser(graph, GraphDir.OutDir, cleanStartNodes.toArray, maxSteps, new Random())).buildDistances(elapsed, dMap, decay)
       printf("\nWalk number %s computed %s distances in %s milis.", walksDone, expectedN, (elapsed()-oldTime).inMillis.toInt)
       walksDone += 1
-      if (walksDone % 5 == 0) assert(false)
+      //if (walksDone % 5 == 0) assert(false)
     }
-
-     val duration = elapsed()
+    printf("\n We have a total of %s distances", dMap.size)
+    val duration = elapsed()
     printf("\nDrunk mob made %s walks in %s ms:\n", walksDone, duration.inMillis.toInt)
 
   }
