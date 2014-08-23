@@ -83,10 +83,10 @@ object ParallelRandomWalks {
         while (stepsTaken < maxSteps && !allFinished) {
           if (debug) walksCounter = walks.filter(_ != -1).size
           takeRandomStep(walks)
+          stepsTaken += 1
           if (debug) walksCounter -= walks.filter(_ != -1).size
           if (debug) nonCoalesced += walksCounter
           coalesceStep(walks, stepsTaken)
-          stepsTaken += 1
           allFinished = walks.forall(_ == -1)
         }
         if (debug) {
@@ -423,9 +423,12 @@ object ParallelRandomWalks {
     startNodes.view.zipWithIndex foreach {
       case (nodeIdx, matIdx) => nodeToMatIdx(nodeIdx) = matIdx
     }
+    startNodes foreach {
+      case (node) => dMap(((node.toLong) << 32) | (node.toLong & 0xffffffffL)) = 1
+    }
 
     val oSWriter = new OutputStreamWriter(new GZIPOutputStream(new BufferedOutputStream(new FileOutputStream("/Users/huitseeker/tmp/Weve/hostgraph/simrank_websites.mtx.gz"))))
-    oSWriter.write("% %MatrixMarket matrix coordinate real symmetric\n")
+    oSWriter.write("%%MatrixMarket matrix coordinate real symmetric\n")
     oSWriter.write("% This is a SimRank distance matrix for the 2014 web crawl graph.\n")
     oSWriter.write(s"% It was computed using $maxWalks random walks of length $maxSteps and a decay factor of $decay\n")
     oSWriter.write(s"${startNodes.size} ${startNodes.size} ${dMap.size}\n")
